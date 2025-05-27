@@ -1,0 +1,102 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from joblib import dump, load
+from datetime import datetime, timedelta
+
+# Config paths
+MODEL_PATH = 'model/isolation_forest.pkl'
+SCALER_PATH = 'model/scaler.pkl'
+HISTORICAL_DATA_PATH = 'data/historical.csv'
+DAILY_DATA_DIR = 'data/daily_inputs'
+OUTPUT_DIR = 'data/outputs'
+
+# Features to use
+FEATURE_COLUMNS = ['bytes_in', 'bytes_out', 'bytes_ratio']
+
+def load_historical_data():
+    return pd.read_csv(HISTORICAL_DATA_PATH, parse_dates=['timestamp'])
+
+def preprocess(df):
+    df = df.copy()
+    df['bytes_ratio'] = df['bytes_in'] / (df['bytes_out'] + 1)  # Avoid div by 0
+    return df
+
+def scale_features(df, scaler=None):
+    X = df[FEATURE_COLUMNS].fillna(0)
+    if scaler is None:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+    else:
+        X_scaled = scaler.transform(X)
+    return X_scaled, scaler
+
+def train_model(df):
+    df = preprocess(df)
+    X_scaled, scaler = scale_features(df)
+    model = IsolationForest(contamination=0.01, random_state=42)
+    model.fit(X_scaled)
+    return model, scaler
+
+def save_model(model, scaler):
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    dump(model, MODEL_PATH)
+    dump(scaler, SCALER_PATH)
+
+def load_model():
+    model = load(MODEL_PATH)
+    scaler = load(SCALER_PATH)
+    return model, scaler
+
+def detect_anomalies(model, scaler, df):
+    df = preprocess(df)
+    X_scaled, _ = scale_features(df, scaler)
+    df['anomaly_score'] = model.decision_function(X_scaled)
+    df['anomaly'] = model.predict(X_scaled)
+    return df
+
+def update_historical(df_new):
+    df_hist = load_historical_data()
+    df_combined = pd.concat([df_hist, df_new[df_new['anomaly'] == 1]])  # Only append normal data
+    df_combined.to_csv(HISTORICAL_DATA_PATH, index=False)
+
+def daily_run():
+    # Step 1: Load yesterday’s data
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    daily_file = os.path.join(DAILY_DATA_DIR, f"{yesterday}.csv")
+    if not os.path.exists(daily_file):
+        print(f"[INFO] No data for {yesterday}. Exiting.")
+        return
+
+    df_daily = pd.read_csv(daily_file, parse_dates=['timestamp'])
+
+    # Step 2: Load model (or train if missing)
+    if not os.path.exists(MODEL_PATH):
+        print("[INFO] No existing model found. Training a new one...")
+        df_hist = load_historical_data()
+        model, scaler = train_model(df_hist)
+        save_model(model, scaler)
+    else:
+        model, scaler = load_model()
+
+    # Step 3: Detect anomalies
+    df_result = detect_anomalies(model, scaler, df_daily)
+
+    # Step 4: Save results
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_file = os.path.join(OUTPUT_DIR, f"anomalies_{yesterday}.csv")
+    df_result.to_csv(output_file, index=False)
+    print(f"[INFO] Anomaly detection complete. Output saved to {output_file}")
+
+    # Step 5: Update historical data with normal entries
+    update_historical(df_result)
+
+    # Optional: retrain model weekly, monthly, etc.
+    # df_hist_updated = load_historical_data()
+    # model, scaler = train_model(df_hist_updated)
+    # save_model(model, scaler)
+
+if __name__ == '__main__':
+    daily_run()
